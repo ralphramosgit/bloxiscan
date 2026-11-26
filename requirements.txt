@@ -1,0 +1,7 @@
+numpy>=1.26
+scipy>=1.11
+opencv-python-headless>=4.8
+open3d>=0.18
+trimesh>=4.0
+matplotlib>=3.8
+pytest>=7
