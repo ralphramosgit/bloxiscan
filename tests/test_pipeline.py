@@ -258,3 +258,51 @@ def test_orbit_center_and_background_crop(tmp_path):
     st = json.loads((out / "stats.json").read_text())
     assert st["watertight"]
     assert np.allclose(st["size_xyz"], [0.3, 0.3, 0.3], atol=0.03), st["size_xyz"]
+
+
+def test_make_mesh_carves_from_masks(tmp_path):
+    """A plain cylinder (like a bottle: almost no points on it) on a table, in
+    front of a wall with more points than the table, in a rotated and scaled
+    'COLMAP' frame. With --masks the mesh must be the cylinder: upright, closed,
+    the right size, and the table (not the wall) must be found."""
+    from tests.test_core import cylinder_views
+    r, h, s_col = 0.15, 0.4, 3.7
+    R = Rotation.random(random_state=5).as_matrix()
+    T = np.array([2.0, -1.0, 0.5])
+    to_colmap = lambda X: s_col * np.asarray(X) @ R.T + T
+
+    views = cylinder_views(r, h, n_views=30, elevations=(25, 40, 55))
+    model, masks = tmp_path / "model", tmp_path / "masks"
+    model.mkdir()
+    masks.mkdir()
+    (model / "cameras.txt").write_text("1 PINHOLE 640 480 800 800 320 240\n")
+    K = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1.0]])   # make_camera's K
+    lines = []
+    for i, (P, mask) in enumerate(views):
+        Rt = np.linalg.inv(K) @ P                          # [R_c | t_c]
+        Rc = Rt[:, :3] @ R.T                               # same camera, COLMAP frame
+        tc = s_col * Rt[:, 3] - Rc @ T
+        x, y, z, w = Rotation.from_matrix(Rc).as_quat()
+        lines += [f"{i + 1} {w} {x} {y} {z} {tc[0]} {tc[1]} {tc[2]} 1 f{i:03d}.jpg", ""]
+        cv2.imwrite(str(masks / f"f{i:03d}.png"), mask.astype(np.uint8) * 255)
+    (model / "images.txt").write_text("\n".join(lines) + "\n")
+
+    rng = np.random.default_rng(2)
+    table = np.c_[rng.uniform(-0.8, 0.8, (8000, 2)), np.zeros(8000)]
+    wall = np.c_[np.full(30000, -0.35), rng.uniform(-0.8, 0.8, 30000), rng.uniform(0, 0.8, 30000)]
+    a = rng.uniform(0, 2 * np.pi, 300)
+    label = np.c_[r * np.cos(a), r * np.sin(a), rng.uniform(0.1, 0.2, 300)]   # a few points
+    pts = to_colmap(np.vstack([table, wall, label]) + rng.normal(0, 0.002, (38300, 3)))
+    o3d.io.write_point_cloud(str(tmp_path / "points.ply"),
+                             o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts)))
+    out = tmp_path / "out"
+    log = run("scripts/make_mesh.py", tmp_path / "points.ply", "--out", out, "--depth", "7",
+              "--target", "3000", "--cameras", model, "--masks", masks, "--scale", 1 / s_col,
+              "--carve-res", "80")
+    st = json.loads((out / "stats.json").read_text())
+    assert abs(np.array(st["plane"]["normal"]) @ (R @ [0, 0, 1.0])) > 0.99, log   # table
+    assert st["watertight"] and st["triangles"] <= 3000
+    w, ht, d = st["size_xyz"]
+    assert abs(w - 2 * r) < 0.02 and abs(d - 2 * r) < 0.02, st["size_xyz"]
+    assert h - 0.01 < ht < h + r * np.tan(np.radians(25)) + 0.01, st["size_xyz"]
+    assert "warning" not in log, log

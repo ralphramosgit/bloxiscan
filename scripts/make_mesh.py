@@ -6,17 +6,29 @@ Your object (phone video), scaled by the ArUco marker:
 No marker: give the object's real height in metres instead:
     python scripts/make_mesh.py work/obj/dense/0/fused.ply --out out/obj --real-height 0.21
 
+Smooth, plain object (bottle, mug) with no dense cloud: carve it from its
+outlines instead. Make masks from the undistorted frames, then pass them:
+    swift scripts/make_masks.swift work/obj/dense/0/images work/obj/masks
+    python scripts/make_mesh.py work/obj/points.ply --out out/obj \
+        --cameras work/obj/dense/0/sparse_txt --masks work/obj/masks --real-height 0.15
+
 DTU scan (keep DTU's coordinates for evaluation, no table removal):
     python scripts/make_mesh.py scan24/dense/fused.ply --out out/scan24 --no-plane --keep-frame
 
 Steps (ours = written in this repo, lib = library call):
   1. ours  RANSAC plane fit finds the table; table points are removed and the
-           table normal becomes "up" (+Y, which glTF and Roblox use)
+           table normal becomes "up" (+Y, which glTF and Roblox use). With
+           --cameras, only planes within 30 deg of the orbit's "up" count, so
+           a wall behind the object cannot be taken for the table
   2. ours  with --cameras: keep points near where the camera circled, then cut the
            object out with a cylinder around its axis (bloxiscan/isolate.py);
      lib   otherwise DBSCAN (Open3D) -> crop to the biggest cluster
+     ours  with --masks: replace the points with the object's visual hull,
+           carved from its silhouettes (bloxiscan/carve.py)
   3. lib   Screened Poisson reconstruction (Open3D), trim low-density vertices
-  4. ours  keep the largest connected piece, fill holes, check watertight
+  4. ours  keep the largest connected piece, fill flat holes (a hole whose rim
+           winds around in 3D is left open: it means the input had a gap),
+           check watertight
   5. ours  QEM simplification to --target triangles (or --simplifier open3d)
   6. ours  metric scale (ArUco result, real height, or a number), export .glb in metres
 """
@@ -27,16 +39,18 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import open3d as o3d
 import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bloxiscan.carve import visual_hull  # noqa: E402
 from bloxiscan.colmap_io import read_model_text  # noqa: E402
-from bloxiscan.geometry import orbit_center, ransac_plane, rotation_between  # noqa: E402
+from bloxiscan.geometry import orbit_center, orbit_up, ransac_plane, rotation_between  # noqa: E402
 from bloxiscan.isolate import isolate_object  # noqa: E402
-from bloxiscan.meshops import (euler_characteristic, fill_holes,  # noqa: E402
-                               is_watertight, keep_largest_component)
+from bloxiscan.meshops import (boundary_loops, euler_characteristic,  # noqa: E402
+                               fill_holes, is_watertight, keep_largest_component)
 from bloxiscan.qem import simplify  # noqa: E402
 
 
@@ -57,6 +71,25 @@ def biggest_cluster_box(pts, size):
     return p.min(0) - pad, p.max(0) + pad
 
 
+def load_views(cams, imgs, mask_dir):
+    """(P, mask) for every image that has <name>.png in mask_dir."""
+    views, resized = [], 0
+    for im in imgs.values():
+        path = Path(mask_dir) / (Path(im.name).stem + ".png")
+        if not path.exists():
+            continue
+        cam = cams[im.camera_id]
+        m = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if m.shape != (cam.height, cam.width):
+            resized += 1
+            m = cv2.resize(m, (cam.width, cam.height), interpolation=cv2.INTER_NEAREST)
+        views.append((im.P(cam), m > 127))
+    if resized:
+        print(f"  warning: {resized} masks differ in size from their camera; make the "
+              "masks from the undistorted images (dense/0/images)")
+    return views
+
+
 def simplify_open3d(V, F, target):
     m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(V), o3d.utility.Vector3iVector(F))
     m = m.simplify_quadric_decimation(target_number_of_triangles=target)
@@ -74,7 +107,8 @@ def main():
     ap.add_argument("--no-cluster", action="store_true", help="skip the DBSCAN crop")
     ap.add_argument("--keep-frame", action="store_true", help="do not rotate/move the model (DTU)")
     ap.add_argument("--depth", type=int, default=9, help="Poisson octree depth")
-    ap.add_argument("--trim", type=float, default=0.02, help="density quantile to trim")
+    ap.add_argument("--trim", type=float, help="density quantile to trim "
+                    "(default 0.02; 0 with --masks, whose surface has no gaps)")
     ap.add_argument("--target", type=int, default=20000, help="triangle budget")
     ap.add_argument("--simplifier", choices=["ours", "open3d"], default="ours")
     ap.add_argument("--scale", type=float, default=1.0, help="multiply coordinates (to metres)")
@@ -88,9 +122,22 @@ def main():
     ap.add_argument("--no-isolate", action="store_true", help="skip the object cut-out")
     ap.add_argument("--real-height", type=float,
                     help="no marker: the object's real height in metres (e.g. 0.21)")
+    ap.add_argument("--masks", help="folder of object masks (<frame>.png, white = object) "
+                    "from scripts/make_masks.swift: carve the object from its outlines "
+                    "(needs --cameras)")
+    ap.add_argument("--carve-res", type=int, default=160,
+                    help="carving voxels along the object's longest side")
+    ap.add_argument("--carve-keep", type=float, default=0.9,
+                    help="keep a voxel if it is inside this fraction of the masks that see it")
+    ap.add_argument("--hole-flatness", type=float, default=0.1,
+                    help="only fill holes whose rim is at least this flat (0 = flat)")
     ap.add_argument("--voxel", type=float, default=0.0,
                     help="downsample the input to one point per voxel of this size first")
     a = ap.parse_args()
+    if a.masks and not a.cameras:
+        ap.error("--masks needs --cameras (the undistorted model, dense/0/sparse_txt)")
+    if a.trim is None:
+        a.trim = 0.0 if a.masks else 0.02
     os.makedirs(a.out, exist_ok=True)
     log = {"input": a.input}
     t_start = time.time()
@@ -104,13 +151,14 @@ def main():
     pts = np.asarray(pcd.points)
     nrm = np.asarray(pcd.normals) if not need_normals else np.zeros_like(pts)
 
-    center = view_half = None
+    center = view_half = up_hint = None
     if a.cameras:
         # every frame looks at the object, so the viewing axes meet there
         cams, imgs = read_model_text(a.cameras)
         C = np.array([im.center for im in imgs.values()])
         D = np.array([im.R.T @ np.array([0.0, 0.0, 1.0]) for im in imgs.values()])
         center = orbit_center(C, D)
+        up_hint = orbit_up(C, D)
         dist = float(np.median(np.linalg.norm(C - center, axis=1)))
         cam = next(iter(cams.values()))
         view_half = dist * (cam.height / 2) / cam.K[1, 1]
@@ -127,9 +175,16 @@ def main():
     size = robust_size(pts)
     up_R, plane = None, None
     if not a.no_plane:
-        n, d, inl = ransac_plane(pts, a.plane_thresh * size, rng=0)
+        fit = ransac_plane(pts, a.plane_thresh * size, rng=0, normal_hint=up_hint)
+        if fit is None:
+            sys.exit("No table plane within 30 deg of the camera orbit's 'up'. "
+                     "Use --no-plane, or check the camera model.")
+        n, d, inl = fit
         frac = inl.mean()
-        side = np.sign(np.median(pts[~inl] @ n + d))
+        if up_hint is not None:                    # cameras are above the table
+            side = np.sign(n @ up_hint)
+        else:
+            side = np.sign(np.median(pts[~inl] @ n + d))
         n, d = n * side, d * side                  # object on the positive side
         above = (pts @ n + d) > a.plane_thresh * size
         print(f"Table plane: {frac:.0%} of points; keeping {above.sum():,} above it")
@@ -148,14 +203,35 @@ def main():
             print(f"Object cut-out: {len(pts):,} points inside a cylinder of radius "
                   f"{iso['radius']:.3f} around the object's axis")
 
-    if not a.no_cluster and iso is None:
+    carved = False
+    if a.masks:
+        if plane is None:
+            sys.exit("--masks needs the table plane (do not combine with --no-plane)")
+        views = load_views(cams, imgs, a.masks)
+        if len(views) < 10:
+            sys.exit(f"Only {len(views)} masks in {a.masks} match the cameras' image names")
+        axis = iso["axis"] if iso else center
+        t0 = time.time()
+        pts, nrm, info = visual_hull(views, plane[0], plane[1], axis,
+                                     a.focus_radius * view_half, 2 * a.focus_radius * view_half,
+                                     res=a.carve_res, keep_ratio=a.carve_keep)
+        carved = True
+        print(f"Carved from {info['views']} masks: {info['voxels_kept']:,} voxels "
+              f"({info['grid'][0]}x{info['grid'][1]}x{info['grid'][2]}), "
+              f"{len(pts):,} surface points ({time.time() - t0:.1f}s)")
+        if info["touches_box"]:
+            print("  warning: the object reaches the edge of the search box; "
+                  "raise --focus-radius")
+        log["carve"] = info
+
+    if not a.no_cluster and iso is None and not carved:
         box = biggest_cluster_box(pts, size)
         if box is not None:
             keep = np.all((pts >= box[0]) & (pts <= box[1]), axis=1)
             pts, nrm = pts[keep], nrm[keep]
             print(f"Biggest cluster: {len(pts):,} points")
 
-    if need_normals:
+    if need_normals and not carved:
         # sparse COLMAP points and scanner point clouds have no normals:
         # estimate them from 30 neighbours, make neighbours agree, then point
         # them away from the object's center (outward) on average
@@ -180,30 +256,49 @@ def main():
         pts[:, 0] -= c[0]
         pts[:, 2] -= c[2]
 
+    if len(pts) < 5000 and not carved:
+        print(f"  warning: only {len(pts):,} points reach Poisson, so most of the surface "
+              "will be guessed. Use a dense cloud (fused.ply) or carve with --masks.")
+
     # --- Poisson (library)
     t0 = time.time()
     cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
     cloud.normals = o3d.utility.Vector3dVector(nrm)
-    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(cloud, depth=a.depth)
+    # one thread: Open3D 0.20's multi-threaded Poisson sometimes aborts the
+    # whole process ("Failed to close loop"); single-threaded is about as fast
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        cloud, depth=a.depth, n_threads=1)
     dens = np.asarray(dens)
-    mesh.remove_vertices_by_mask(dens < np.quantile(dens, a.trim))
-    lo, hi = pts.min(0), pts.max(0)
-    pad = 0.02 * size
-    if not a.keep_frame and plane is not None:
-        lo[1] = 0.0                               # nothing below the table
-    V = np.asarray(mesh.vertices)
-    outside = np.any((V < lo - pad) | (V > hi + pad), axis=1)
-    if not a.keep_frame and plane is not None:
-        outside |= V[:, 1] < 0.0
-    mesh.remove_vertices_by_mask(outside)
-    V, F = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+    if a.trim > 0:
+        mesh.remove_vertices_by_mask(dens < np.quantile(dens, a.trim))
+    if carved:
+        # the carved surface is closed: keep it whole, just flatten the
+        # bottom where Poisson's smoothing dips below the table
+        V, F = np.asarray(mesh.vertices).copy(), np.asarray(mesh.triangles)
+        if not a.keep_frame:
+            V[:, 1] = np.maximum(V[:, 1], 0.0)
+    else:
+        lo, hi = pts.min(0), pts.max(0)
+        pad = 0.02 * size
+        if not a.keep_frame and plane is not None:
+            lo[1] = 0.0                           # nothing below the table
+        V = np.asarray(mesh.vertices)
+        outside = np.any((V < lo - pad) | (V > hi + pad), axis=1)
+        if not a.keep_frame and plane is not None:
+            outside |= V[:, 1] < 0.0
+        mesh.remove_vertices_by_mask(outside)
+        V, F = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
     print(f"Poisson depth {a.depth}: {len(F):,} triangles ({time.time() - t0:.1f}s)")
 
     # --- cleanup (ours)
     V, F = keep_largest_component(V, F)
-    V, F, n_holes = fill_holes(V, F)
+    n_loops = len(boundary_loops(F))
+    V, F, n_holes = fill_holes(V, F, max_flatness=a.hole_flatness)
     print(f"Largest piece: {len(F):,} triangles, filled {n_holes} holes, "
           f"watertight={is_watertight(F)}")
+    if n_loops > n_holes:
+        print(f"  warning: left {n_loops - n_holes} hole(s) open whose rim is not flat. "
+              "The input had a big gap there; filling it would add a fan of slivers.")
     s = a.scale
     if a.scale_json:
         with open(a.scale_json) as f:

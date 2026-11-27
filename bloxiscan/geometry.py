@@ -140,17 +140,24 @@ def fit_plane_lstsq(points):
     return n, -float(n @ c)
 
 
-def ransac_plane(points, threshold, confidence=0.999, max_iters=5000, rng=None):
+def ransac_plane(points, threshold, confidence=0.999, max_iters=5000, rng=None,
+                 normal_hint=None, max_angle_deg=30.0):
     """Robustly fit the dominant plane (e.g. the table) to a point cloud.
 
     Each trial: 3 random points -> plane -> count points within `threshold`.
     The number of trials adapts with ransac_trials() as better models appear.
     The best inlier set is refit with least squares.
-    Returns (normal (3,), d, inlier_mask).
+    normal_hint: if given, only planes whose normal is within max_angle_deg of
+    it (either sign) are considered, so a wall behind the object cannot win
+    over the table it stands on.
+    Returns (normal (3,), d, inlier_mask), or None if no plane fits the hint.
     """
     rng = np.random.default_rng(rng)
     pts = np.asarray(points, float)
     n_pts = len(pts)
+    if normal_hint is not None:
+        hint = np.asarray(normal_hint, float) / np.linalg.norm(normal_hint)
+        min_cos = np.cos(np.radians(max_angle_deg))
     best_mask, best_count = None, -1
     needed, it = max_iters, 0
     while it < min(needed, max_iters):
@@ -161,12 +168,16 @@ def ransac_plane(points, threshold, confidence=0.999, max_iters=5000, rng=None):
         if norm < 1e-12:
             continue  # collinear sample
         normal /= norm
+        if normal_hint is not None and abs(normal @ hint) < min_cos:
+            continue  # too steep to be the table
         d = -normal @ a
         mask = np.abs(pts @ normal + d) < threshold
         count = int(mask.sum())
         if count > best_count:
             best_mask, best_count = mask, count
             needed = ransac_trials(confidence, count / n_pts, 3)
+    if best_mask is None:
+        return None
     n, d = fit_plane_lstsq(pts[best_mask])
     mask = np.abs(pts @ n + d) < threshold
     return n, d, mask
@@ -209,3 +220,17 @@ def orbit_center(centers, directions):
         A += P
         b += P @ c
     return np.linalg.solve(A, b)
+
+
+def orbit_up(centers, directions):
+    """'Up' from the way the camera circled the object.
+
+    The camera centers lie roughly on a horizontal circle, so the normal of
+    their best-fit plane (fit_plane_lstsq) is vertical. Its sign is chosen so
+    the cameras look down at the object on average (mean direction . up < 0).
+    Independent of how the phone was held, unlike the image's 'up' axis.
+    """
+    n, _ = fit_plane_lstsq(np.asarray(centers, float))
+    if np.mean(np.asarray(directions, float), axis=0) @ n > 0:
+        n = -n
+    return n

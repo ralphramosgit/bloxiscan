@@ -39,7 +39,7 @@ def isolate_object(points, up, d, orbit_point, view_half, plane_thresh,
 
     r = np.linalg.norm(horizontal_offsets(points, axis, up), axis=1)
     near = (h > plane_thresh) & (r < 0.5 * view_half)
-    if near.sum() < 20:
+    if near.sum() < 20 or (near & (r < search)).sum() < 20:
         return near, None
     top = np.percentile(h[near & (r < search)], 99)
 

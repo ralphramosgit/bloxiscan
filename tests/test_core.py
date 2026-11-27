@@ -11,7 +11,7 @@ import open3d as o3d
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bloxiscan import blur, geometry as geo, meshops, metrics, qem  # noqa: E402
+from bloxiscan import blur, carve, geometry as geo, meshops, metrics, qem  # noqa: E402
 from bloxiscan.colmap_io import read_model_text  # noqa: E402
 
 RNG = np.random.default_rng(0)
@@ -117,6 +117,30 @@ def test_ransac_plane_with_outliers():
     assert mask[:600].mean() > 0.97 and mask[600:].mean() < 0.05
 
 
+def test_ransac_plane_hint_ignores_wall():
+    """A wall with 3x the points of the floor wins plain RANSAC; with the
+    camera orbit's 'up' as a hint the floor is found."""
+    floor = np.c_[RNG.uniform(-1, 1, (500, 2)), np.zeros(500)]
+    wall = np.c_[np.full(1500, -1.0), RNG.uniform(-1, 1, 1500), RNG.uniform(0, 2, 1500)]
+    pts = np.vstack([floor, wall]) + RNG.normal(0, 0.002, (2000, 3))
+    n, _, _ = geo.ransac_plane(pts, 0.01, rng=0)
+    assert abs(n[0]) > 0.99                                   # the wall
+    n, d, mask = geo.ransac_plane(pts, 0.01, rng=0, normal_hint=[0.1, 0, 1])
+    assert abs(n[2]) > 0.999 and abs(d) < 0.01 and mask[:500].mean() > 0.97
+    assert geo.ransac_plane(floor, 0.01, rng=0, normal_hint=[1, 0, 0]) is None
+
+
+def test_orbit_up():
+    """Cameras circling at different heights, looking down: up is +z,
+    whatever the orbit's direction of travel."""
+    target = np.array([0.0, 0.0, 0.2])
+    for sign in (1, -1):
+        ang = sign * np.linspace(0, 2 * np.pi, 20, endpoint=False)
+        C = np.c_[np.cos(ang), np.sin(ang), 0.5 + 0.05 * np.sin(3 * ang)]
+        up = geo.orbit_up(C, target - C)
+        assert up[2] > 0.99
+
+
 def test_rotation_between():
     a, b = RNG.normal(size=3), RNG.normal(size=3)
     R = geo.rotation_between(a, b)
@@ -166,6 +190,17 @@ def test_fill_holes_restores_watertight():
     assert n >= 2 and meshops.is_watertight(F2)
 
 
+def test_fill_holes_leaves_winding_rim_open():
+    """A flat hole is filled; a rim that winds around in 3D (here: a band cut
+    out of the sphere, like Poisson around a gap in the data) is left open."""
+    V, F = sphere(30)
+    c = V[F].mean(1)
+    flat = c[:, 2] < -0.8                                # bottom cap: flat rim
+    band = (np.abs(c[:, 0]) < 0.15) & (c[:, 2] > 0)      # half a slot: winding rim
+    V2, F2, n = meshops.fill_holes(V, F[~(flat | band)], max_flatness=0.1)
+    assert n == 1 and len(meshops.boundary_loops(F2)) == 1
+
+
 def test_largest_component():
     V, F = sphere(20)
     V_small, F_small = sphere(5)
@@ -212,3 +247,53 @@ def test_colmap_text_reader(tmp_path):
     X = np.array([[0.1, 0.2, 0.3]])
     assert np.allclose(geo.project(imgs[1].P(cams[1]), X),
                        geo.project(geo.projection_matrix(K, R, t), X))
+
+
+# ------------------------------------------------------------- carving
+def cylinder_views(r, h, n_views=24, elevations=(30, 60), size=(480, 640)):
+    """Cameras circling a cylinder (axis z, standing on z = 0) and its exact
+    silhouettes (the convex hull of the projected cylinder)."""
+    ang = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+    rim = np.c_[r * np.cos(ang), r * np.sin(ang)]
+    solid = np.vstack([np.c_[rim, np.zeros(64)], np.c_[rim, np.full(64, h)]])
+    views, rng = [], np.random.default_rng(0)
+    for i, a in enumerate(np.linspace(0, 2 * np.pi, n_views, endpoint=False)):
+        e = np.radians(elevations[i % len(elevations)])
+        target = np.array([0, 0, h / 2])
+        C = target + 1.5 * np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
+        K, R, t = make_camera(rng, C, target)
+        P = geo.projection_matrix(K, R, t)
+        mask = np.zeros(size, np.uint8)
+        hull = cv2.convexHull(geo.project(P, solid).astype(np.float32)).astype(np.int32)
+        cv2.fillConvexPoly(mask, hull, 1)
+        views.append((P, mask.astype(bool)))
+    return views
+
+
+def test_visual_hull_of_cylinder():
+    r, h = 0.15, 0.4
+    views = cylinder_views(r, h)
+    pts, nrm, info = carve.visual_hull(views, [0, 0, 1.0], 0.0, np.array([0.03, -0.02, 0.2]),
+                                       0.45, 0.9, res=80)
+    assert not info["touches_box"]
+    side = (pts[:, 2] > 0.3 * h) & (pts[:, 2] < 0.7 * h)
+    rho = np.linalg.norm(pts[side, :2], axis=1)
+    assert abs(np.median(rho) - r) < 0.01, np.median(rho)
+    assert np.all(np.abs(rho - r) < 1.5 * info["voxel"])        # no grooves or bumps
+    assert rho.std() < 0.2 * info["voxel"]                      # no voxel staircase
+    radial = np.c_[pts[side, :2] / rho[:, None], np.zeros(side.sum())]
+    assert np.mean(np.einsum("ij,ij->i", nrm[side], radial)) > 0.95   # outward
+    # the bottom sits on the table; the top may gain a shallow cone
+    # (about r * tan(lowest elevation)) because no camera looks straight down
+    assert pts[:, 2].min() < 0.01
+    assert h - 0.01 < pts[:, 2].max() < h + r * np.tan(np.radians(30)) + 0.01
+
+
+def test_carving_tolerates_a_bad_mask():
+    """One empty mask (a missed detection) must not carve the object away."""
+    views = cylinder_views(0.15, 0.4)
+    views[3] = (views[3][0], np.zeros_like(views[3][1]))
+    pts, _, _ = carve.visual_hull(views, [0, 0, 1.0], 0.0, np.array([0, 0, 0.2]),
+                                  0.45, 0.9, res=60)
+    rho = np.linalg.norm(pts[(pts[:, 2] > 0.1) & (pts[:, 2] < 0.3), :2], axis=1)
+    assert abs(np.median(rho) - 0.15) < 0.015

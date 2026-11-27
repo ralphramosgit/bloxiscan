@@ -3,3 +3,27 @@ Conditioner Bottle (m)
 length =
 width = 
 height =5.75in = 14.605cm = 0.14605m
+
+
+Run: 
+
+ls work/conditioner_bottle/sparse
+colmap model_analyzer --path work/conditioner_bottle/sparse/0
+
+0           project.ini
+I20261126 19:13:48.016453 0x203aad300 model.cc:434] Rigs: 171
+I20261126 19:13:48.016813 0x203aad300 model.cc:435] Cameras: 171
+I20261126 19:13:48.016816 0x203aad300 model.cc:436] Frames: 171
+I20261126 19:13:48.016818 0x203aad300 model.cc:437] Registered frames: 171
+I20261126 19:13:48.016820 0x203aad300 model.cc:439] Images: 171
+I20261126 19:13:48.016821 0x203aad300 model.cc:440] Registered images: 171
+I20261126 19:13:48.016823 0x203aad300 model.cc:442] Points: 21751
+I20261126 19:13:48.016824 0x203aad300 model.cc:443] Observations: 197109
+I20261126 19:13:48.016832 0x203aad300 model.cc:445] Mean track length: 9.062066
+I20261126 19:13:48.016838 0x203aad300 model.cc:447] Mean observations per image: 1152.684211
+I20261126 19:13:48.016842 0x203aad300 model.cc:450] Mean reprojection error: 0.770022px
+
+
+
+
+python scripts/make_mesh.py work/conditioner_bottle/points.ply --out out/conditioner_bottle --depth 8 --no-cluster --cameras work/conditioner_bottle/dense/0/sparse_txt --real-height 0.14605

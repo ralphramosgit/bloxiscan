@@ -92,11 +92,23 @@ def boundary_loops(F):
     return loops
 
 
-def fill_holes(V, F, max_hole_edges=None):
-    """Close every hole with a fan of triangles around the hole's centroid.
+def loop_flatness(P):
+    """How far a hole's rim is from flat: smallest / largest singular value of
+    the centred rim points. ~0 for a flat rim (a fan closes it well), large
+    for a rim that winds around in 3D (a fan makes long crossing slivers)."""
+    s = np.linalg.svd(P - P.mean(axis=0), compute_uv=False)
+    return float(s[2] / max(s[0], 1e-12))
+
+
+def fill_holes(V, F, max_hole_edges=None, max_flatness=None, small_hole_edges=30):
+    """Close holes with a fan of triangles around the hole's centroid.
 
     For a boundary edge a->b (direction inside its existing face), the new face
     must use b->a to keep orientations consistent: triangle (b, a, centroid).
+    Holes with more than max_hole_edges edges are left open, and so are holes
+    with more than small_hole_edges edges whose rim is less flat than
+    max_flatness (see loop_flatness). Small holes are always filled: their
+    fan is small, and their flatness is mostly noise.
     Returns (V, F, number_of_holes_filled).
     """
     V = np.asarray(V, float)
@@ -104,6 +116,9 @@ def fill_holes(V, F, max_hole_edges=None):
     new_v, new_f, filled = [], [], 0
     for loop in boundary_loops(F):
         if max_hole_edges is not None and len(loop) > max_hole_edges:
+            continue
+        if (max_flatness is not None and len(loop) > small_hole_edges
+                and loop_flatness(V[loop]) > max_flatness):
             continue
         c = len(V) + len(new_v)
         new_v.append(V[loop].mean(axis=0))
