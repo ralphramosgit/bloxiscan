@@ -11,7 +11,7 @@ import open3d as o3d
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bloxiscan import blur, carve, geometry as geo, meshops, metrics, qem  # noqa: E402
+from bloxiscan import blur, carve, geometry as geo, meshops, metrics, qem, texture  # noqa: E402
 from bloxiscan.colmap_io import read_model_text  # noqa: E402
 
 RNG = np.random.default_rng(0)
@@ -297,3 +297,67 @@ def test_carving_tolerates_a_bad_mask():
                                   0.45, 0.9, res=60)
     rho = np.linalg.norm(pts[(pts[:, 2] > 0.1) & (pts[:, 2] < 0.3), :2], axis=1)
     assert abs(np.median(rho) - 0.15) < 0.015
+
+
+# ------------------------------------------------------------- texture
+RED, BLUE, GRAY = (220, 40, 40), (40, 40, 220), (128, 128, 128)
+
+
+def two_colour_frames(views, r, h, size=(480, 640)):
+    """Ray-cast images of a cylinder whose top half is red and bottom half is
+    blue (background gray), seen by the cameras of cylinder_views."""
+    import trimesh
+    import open3d as o3d
+    cyl = trimesh.creation.cylinder(r, h, sections=96)
+    cyl.apply_translation([0, 0, h / 2])
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(cyl.vertices.astype(np.float32)),
+                        o3d.core.Tensor(cyl.faces.astype(np.uint32)))
+    K = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1.0]])
+    ys, xs = np.mgrid[0:size[0], 0:size[1]]
+    frames = []
+    for P, _ in views:
+        Rt = np.linalg.inv(K) @ P
+        R, t = Rt[:, :3], Rt[:, 3]
+        C = -R.T @ t
+        d = np.c_[(xs.ravel() + 0.5 - 320) / 800, (ys.ravel() + 0.5 - 240) / 800,
+                  np.ones(xs.size)] @ R
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        hit = scene.cast_rays(o3d.core.Tensor(
+            np.c_[np.repeat(C[None], len(d), 0), d].astype(np.float32)))["t_hit"].numpy()
+        z = C[2] + hit * d[:, 2]
+        img = np.full((xs.size, 3), GRAY, np.uint8)
+        on = np.isfinite(hit)
+        img[on & (z >= h / 2)] = RED
+        img[on & (z < h / 2)] = BLUE
+        frames.append({"K": K, "R": R, "t": t, "image": img.reshape(*size, 3),
+                       "mask": on.reshape(size)})
+    return frames
+
+
+def face_colours(uv, F_uv, tex):
+    c = uv[F_uv].mean(1)
+    n = len(tex)
+    return tex[np.clip(((1 - c[:, 1]) * (n - 1)).round().astype(int), 0, n - 1),
+               np.clip((c[:, 0] * (n - 1)).round().astype(int), 0, n - 1)].astype(int)
+
+
+def test_bake_texture_puts_colours_in_the_right_place():
+    """Bake a texture onto the cylinder from its ray-cast frames: faces on the
+    top half must come out red, faces on the bottom half blue, and the bottom
+    cap (never seen) must still get a colour from its neighbours."""
+    import trimesh
+    r, h = 0.15, 0.4
+    frames = two_colour_frames(cylinder_views(r, h), r, h)
+    cyl = trimesh.creation.cylinder(r, h, sections=64)
+    cyl.apply_translation([0, 0, h / 2])
+    cyl = cyl.subdivide().subdivide()
+    vmap, F_uv, uv, tex, info = texture.bake_texture(cyl.vertices, cyl.faces, frames, size=512)
+    assert len(F_uv) == len(cyl.faces)                    # one UV face per face
+    z = cyl.vertices[vmap][F_uv].mean(1)[:, 2]
+    col = face_colours(uv, F_uv, tex)
+    top, bottom = z > h / 2 + 0.03, (z < h / 2 - 0.03) & (z > 0.01)
+    assert (col[top, 0] > col[top, 2] + 100).mean() > 0.97
+    assert (col[bottom, 2] > col[bottom, 0] + 100).mean() > 0.97
+    assert np.all(np.abs(col - GRAY).sum(1) > 60)          # no background leaked in
+    assert 0.7 < info["texels_seen"] < 1.0                  # the bottom cap was not seen

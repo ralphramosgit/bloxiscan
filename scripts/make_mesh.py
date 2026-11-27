@@ -31,6 +31,8 @@ Steps (ours = written in this repo, lib = library call):
            check watertight
   5. ours  QEM simplification to --target triangles (or --simplifier open3d)
   6. ours  metric scale (ArUco result, real height, or a number), export .glb in metres
+  7. ours  with --texture: colour texture from the frames (bloxiscan/texture.py;
+           lib: xatlas UV layout), embedded in model.glb and saved as texture.png
 """
 import argparse
 import json
@@ -43,6 +45,7 @@ import cv2
 import numpy as np
 import open3d as o3d
 import trimesh
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bloxiscan.carve import visual_hull  # noqa: E402
@@ -52,6 +55,7 @@ from bloxiscan.isolate import isolate_object  # noqa: E402
 from bloxiscan.meshops import (boundary_loops, euler_characteristic,  # noqa: E402
                                fill_holes, is_watertight, keep_largest_component)
 from bloxiscan.qem import simplify  # noqa: E402
+from bloxiscan.texture import bake_texture  # noqa: E402
 
 
 def robust_size(pts):
@@ -87,6 +91,31 @@ def load_views(cams, imgs, mask_dir):
     if resized:
         print(f"  warning: {resized} masks differ in size from their camera; make the "
               "masks from the undistorted images (dense/0/images)")
+    return views
+
+
+def texture_views(cams, imgs, image_dir, mask_dir=None):
+    """Views for bake_texture; frames and masks load when used."""
+    def rgb(path):
+        return lambda: cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+
+    def gray(path, cam):
+        return lambda: cv2.resize(cv2.imread(str(path), cv2.IMREAD_GRAYSCALE),
+                                  (cam.width, cam.height),
+                                  interpolation=cv2.INTER_NEAREST) > 127
+    views = []
+    for im in imgs.values():
+        path = Path(image_dir) / im.name
+        if not path.exists():
+            continue
+        cam = cams[im.camera_id]
+        view = {"K": cam.K, "R": im.R, "t": im.tvec, "image": rgb(path)}
+        if mask_dir:
+            m = Path(mask_dir) / (Path(im.name).stem + ".png")
+            if not m.exists():
+                continue
+            view["mask"] = gray(m, cam)
+        views.append(view)
     return views
 
 
@@ -129,13 +158,19 @@ def main():
                     help="carving voxels along the object's longest side")
     ap.add_argument("--carve-keep", type=float, default=0.9,
                     help="keep a voxel if it is inside this fraction of the masks that see it")
+    ap.add_argument("--texture", metavar="IMAGES",
+                    help="colour the model from these frames: the undistorted ones, "
+                    "dense/0/images (needs --cameras)")
+    ap.add_argument("--texture-size", type=int, default=1024,
+                    help="texture image size in pixels (Roblox shrinks anything over 1024)")
     ap.add_argument("--hole-flatness", type=float, default=0.1,
                     help="only fill holes whose rim is at least this flat (0 = flat)")
     ap.add_argument("--voxel", type=float, default=0.0,
                     help="downsample the input to one point per voxel of this size first")
     a = ap.parse_args()
-    if a.masks and not a.cameras:
-        ap.error("--masks needs --cameras (the undistorted model, dense/0/sparse_txt)")
+    if (a.masks or a.texture) and not a.cameras:
+        ap.error("--masks and --texture need --cameras (the undistorted model, "
+                 "dense/0/sparse_txt)")
     if a.trim is None:
         a.trim = 0.0 if a.masks else 0.02
     os.makedirs(a.out, exist_ok=True)
@@ -248,6 +283,7 @@ def main():
         if np.mean(np.einsum("ij,ij->i", out, nrm)) < 0:
             nrm = -nrm
 
+    frame_R, frame_off = np.eye(3), np.zeros(3)  # model = x @ frame_R.T + frame_off
     if not a.keep_frame and plane is not None:
         up_R = rotation_between(plane[0], [0.0, 1.0, 0.0])
         pts, nrm = pts @ up_R.T, nrm @ up_R.T
@@ -255,6 +291,7 @@ def main():
         c = 0.5 * (pts.min(0) + pts.max(0))
         pts[:, 0] -= c[0]
         pts[:, 2] -= c[2]
+        frame_R, frame_off = up_R, np.array([-c[0], plane[1], -c[2]])
 
     if len(pts) < 5000 and not carved:
         print(f"  warning: only {len(pts):,} points reach Poisson, so most of the surface "
@@ -327,9 +364,31 @@ def main():
     print(f"Simplified ({a.simplifier}) to {len(F2):,} triangles in {secs:.1f}s, "
           f"watertight={wt}, euler={euler_characteristic(F2)}")
 
+    glb = trimesh.Trimesh(V2 * s, F2, process=False)
+    if a.texture:
+        t0 = time.time()
+        views = texture_views(cams, imgs, a.texture, a.masks)
+        if not views:
+            sys.exit(f"No frames in {a.texture} match the cameras' image names")
+        V_colmap = (V2 - frame_off) @ frame_R          # back to the cameras' frame
+        vmap, F_uv, uv, tex, tinfo = bake_texture(V_colmap, F2, views, size=a.texture_size)
+        Image.fromarray(tex).save(os.path.join(a.out, "texture.png"))
+        material = trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.fromarray(tex), metallicFactor=0.0, roughnessFactor=0.9)
+        glb = trimesh.Trimesh(V2[vmap] * s, F_uv, process=False,
+                              visual=trimesh.visual.TextureVisuals(uv=uv, material=material))
+        print(f"Texture {a.texture_size}x{a.texture_size} from {tinfo['views']} frames: "
+              f"{tinfo['texels_seen']:.0%} of the surface seen, the rest filled from "
+              f"its neighbours ({time.time() - t0:.1f}s)")
+        log["texture"] = tinfo
+    # model (metres) -> cameras' frame: x = M @ [v, 1], for re-rendering from the frames
+    M = np.eye(4)
+    M[:3, :3] = frame_R.T / s
+    M[:3, 3] = -frame_R.T @ frame_off
+    log["model_to_cameras"] = M.tolist()
     V2 = V2 * s
     dims = (V2.max(0) - V2.min(0)).tolist()
-    trimesh.Trimesh(V2, F2, process=False).export(os.path.join(a.out, "model.glb"))
+    glb.export(os.path.join(a.out, "model.glb"))
     trimesh.Trimesh(V2, F2, process=False).export(os.path.join(a.out, "model.ply"))
     log.update(simplifier=a.simplifier, triangles=int(len(F2)), watertight=bool(wt),
                simplify_seconds=round(secs, 2), size_xyz=dims,

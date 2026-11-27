@@ -5,3 +5,4 @@ open3d>=0.18
 trimesh>=4.0
 matplotlib>=3.8
 pytest>=7
+xatlas>=0.0.9

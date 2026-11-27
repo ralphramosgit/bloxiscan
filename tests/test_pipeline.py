@@ -265,16 +265,18 @@ def test_make_mesh_carves_from_masks(tmp_path):
     front of a wall with more points than the table, in a rotated and scaled
     'COLMAP' frame. With --masks the mesh must be the cylinder: upright, closed,
     the right size, and the table (not the wall) must be found."""
-    from tests.test_core import cylinder_views
+    from tests.test_core import cylinder_views, face_colours, two_colour_frames
     r, h, s_col = 0.15, 0.4, 3.7
     R = Rotation.random(random_state=5).as_matrix()
     T = np.array([2.0, -1.0, 0.5])
     to_colmap = lambda X: s_col * np.asarray(X) @ R.T + T
 
     views = cylinder_views(r, h, n_views=30, elevations=(25, 40, 55))
-    model, masks = tmp_path / "model", tmp_path / "masks"
+    frames = two_colour_frames(views, r, h)          # top half red, bottom half blue
+    model, masks, images = tmp_path / "model", tmp_path / "masks", tmp_path / "images"
     model.mkdir()
     masks.mkdir()
+    images.mkdir()
     (model / "cameras.txt").write_text("1 PINHOLE 640 480 800 800 320 240\n")
     K = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1.0]])   # make_camera's K
     lines = []
@@ -285,6 +287,8 @@ def test_make_mesh_carves_from_masks(tmp_path):
         x, y, z, w = Rotation.from_matrix(Rc).as_quat()
         lines += [f"{i + 1} {w} {x} {y} {z} {tc[0]} {tc[1]} {tc[2]} 1 f{i:03d}.jpg", ""]
         cv2.imwrite(str(masks / f"f{i:03d}.png"), mask.astype(np.uint8) * 255)
+        cv2.imwrite(str(images / f"f{i:03d}.jpg"),
+                    cv2.cvtColor(frames[i]["image"], cv2.COLOR_RGB2BGR))
     (model / "images.txt").write_text("\n".join(lines) + "\n")
 
     rng = np.random.default_rng(2)
@@ -298,7 +302,7 @@ def test_make_mesh_carves_from_masks(tmp_path):
     out = tmp_path / "out"
     log = run("scripts/make_mesh.py", tmp_path / "points.ply", "--out", out, "--depth", "7",
               "--target", "3000", "--cameras", model, "--masks", masks, "--scale", 1 / s_col,
-              "--carve-res", "80")
+              "--carve-res", "80", "--texture", images, "--texture-size", "256")
     st = json.loads((out / "stats.json").read_text())
     assert abs(np.array(st["plane"]["normal"]) @ (R @ [0, 0, 1.0])) > 0.99, log   # table
     assert st["watertight"] and st["triangles"] <= 3000
@@ -306,3 +310,11 @@ def test_make_mesh_carves_from_masks(tmp_path):
     assert abs(w - 2 * r) < 0.02 and abs(d - 2 * r) < 0.02, st["size_xyz"]
     assert h - 0.01 < ht < h + r * np.tan(np.radians(25)) + 0.01, st["size_xyz"]
     assert "warning" not in log, log
+    # the texture went through the model -> camera transform: top red, bottom blue
+    m = trimesh.load(out / "model.glb", force="mesh")
+    tex = np.asarray(m.visual.material.baseColorTexture.convert("RGB"))
+    col = face_colours(m.visual.uv, m.faces, tex)
+    y = m.vertices[m.faces].mean(1)[:, 1]
+    top, bottom = y > h / 2 + 0.03, (y < h / 2 - 0.03) & (y > 0.02)
+    assert (col[top, 0] > col[top, 2] + 80).mean() > 0.95
+    assert (col[bottom, 2] > col[bottom, 0] + 80).mean() > 0.95
