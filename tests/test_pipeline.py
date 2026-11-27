@@ -197,3 +197,64 @@ def test_dtu_mask_points_and_scale_mat(tmp_path):
         "--mesh", tmp_path / "m.ply", "--out", tmp_path / "m_world.ply")
     Vw = trimesh.load(tmp_path / "m_world.ply", process=False).vertices
     assert np.allclose(Vw, V * 0.3 * s + t)
+
+
+def test_make_mesh_real_height(tmp_path):
+    """No marker: --real-height 0.6 must make the upright ball 0.6 m tall."""
+    rng = np.random.default_rng(7)
+    d = rng.normal(size=(30000, 3))
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    ball = d * 0.3 + [0, 0, 0.4]
+    table = np.c_[rng.uniform(-1, 1, (30000, 2)), np.zeros(30000)]
+    pts = np.vstack([ball, table])
+    nrm = np.vstack([d, np.tile([0, 0, 1.0], (30000, 1))])
+    R = Rotation.random(random_state=3).as_matrix()
+    pts = 5.0 * pts @ R.T          # unknown COLMAP scale
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+    pcd.normals = o3d.utility.Vector3dVector(nrm @ R.T)
+    o3d.io.write_point_cloud(str(tmp_path / "fused.ply"), pcd)
+    out = tmp_path / "out"
+    run("scripts/make_mesh.py", tmp_path / "fused.ply", "--out", out, "--depth", "8",
+        "--target", "3000", "--real-height", "0.6")
+    st = json.loads((out / "stats.json").read_text())
+    assert abs(st["size_xyz"][1] - 0.6) < 0.01, st["size_xyz"]
+
+
+def test_orbit_center_and_background_crop(tmp_path):
+    """Cameras circle a ball on a table in a cluttered room. The orbit-center
+    crop must cut the clutter away so the mesh is just the ball."""
+    from bloxiscan.geometry import orbit_center
+    rng = np.random.default_rng(11)
+    target = np.array([0.0, 0.0, 0.4])
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "cameras.txt").write_text("1 PINHOLE 640 480 500 500 320 240\n")
+    lines, C, D = [], [], []
+    for i, ang in enumerate(np.linspace(0, 2 * np.pi, 16, endpoint=False)):
+        c = target + np.array([1.2 * np.cos(ang), 1.2 * np.sin(ang), 0.5 + 0.1 * (i % 2)])
+        K, R, t = make_camera(rng, c, target)
+        x, y, z, w = Rotation.from_matrix(R).as_quat()
+        lines += [f"{i + 1} {w} {x} {y} {z} {t[0]} {t[1]} {t[2]} 1 f{i:03d}.jpg", ""]
+        C.append(c)
+        D.append(R.T @ np.array([0, 0, 1.0]))
+    (model / "images.txt").write_text("\n".join(lines) + "\n")
+    assert np.linalg.norm(orbit_center(C, D) - target) < 1e-6
+
+    d = rng.normal(size=(30000, 3))
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    ball = d * 0.15 + target
+    table = np.c_[rng.uniform(-0.6, 0.6, (20000, 2)), np.full(20000, 0.24)]
+    clutter = rng.uniform(-3, 3, (15000, 3))
+    clutter = clutter[np.linalg.norm(clutter[:, :2], axis=1) > 1.5]   # around the room
+    pts = np.vstack([ball, table, clutter])
+    nrm = np.vstack([d, np.tile([0, 0, 1.0], (20000, 1)),
+                     rng.normal(size=(len(clutter), 3))])
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+    pcd.normals = o3d.utility.Vector3dVector(nrm / np.linalg.norm(nrm, axis=1, keepdims=True))
+    o3d.io.write_point_cloud(str(tmp_path / "fused.ply"), pcd)
+    out = tmp_path / "out"
+    run("scripts/make_mesh.py", tmp_path / "fused.ply", "--out", out, "--depth", "8",
+        "--target", "3000", "--no-cluster", "--cameras", model, "--real-height", "0.3")
+    st = json.loads((out / "stats.json").read_text())
+    assert st["watertight"]
+    assert np.allclose(st["size_xyz"], [0.3, 0.3, 0.3], atol=0.03), st["size_xyz"]

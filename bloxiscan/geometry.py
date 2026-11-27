@@ -190,3 +190,22 @@ def rotation_between(a, b):
         return 2.0 * np.outer(axis, axis) - np.eye(3)
     vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+
+# ------------------------------------------------------------ orbit center
+def orbit_center(centers, directions):
+    """The point the camera kept looking at while circling the object.
+
+    Each frame's viewing axis is a line (camera center c, direction d). The
+    point x closest to all lines in the least-squares sense minimizes
+    sum_i ||(I - d_i d_i^T)(x - c_i)||^2, which gives the 3x3 linear system
+    [sum_i (I - d_i d_i^T)] x = sum_i (I - d_i d_i^T) c_i.
+    """
+    A = np.zeros((3, 3))
+    b = np.zeros(3)
+    for c, d in zip(np.asarray(centers, float), np.asarray(directions, float)):
+        d = d / np.linalg.norm(d)
+        P = np.eye(3) - np.outer(d, d)
+        A += P
+        b += P @ c
+    return np.linalg.solve(A, b)
